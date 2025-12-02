@@ -1,104 +1,102 @@
 import os
-from dotenv import load_dotenv
-
 import psycopg2
+from psycopg2.extras import Json
+from typing import List
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
 
-# Load environment variables from .env if present (local dev),
-# but in Cloud Shell we mostly use exported env vars.
-load_dotenv()
+# --- Config from environment ---
+GCP_PROJECT = os.environ["GCP_PROJECT"]
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
 
-PROJECT_ID = os.getenv("GCP_PROJECT", "starry-journal-480011-m8")
-LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ["DB_NAME"]
+DB_USER = os.environ["DB_USER"]
+DB_PASSWORD = os.environ["DB_PASSWORD"]
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME", "ragdb")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-
-# text-embedding-004 produces 768-dim embeddings
-EMBEDDING_DIM = 768
 EMBEDDING_MODEL_NAME = "text-embedding-004"
 
 
+def init_vertex() -> TextEmbeddingModel:
+    """Initialise Vertex AI and return the embedding model."""
+    vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
+    print("🔧 Initialising Vertex + Cloud SQL...")
+    model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL_NAME)
+    return model
+
+
 def get_connection():
-    """Connect to Cloud SQL Postgres with SSL over public IP."""
-    return psycopg2.connect(
+    """Plain psycopg2 connection to Cloud SQL using PUBLIC IP."""
+    conn = psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASSWORD,
-        sslmode="require",
+        connect_timeout=10,
+        sslmode="require",  # optional but recommended
     )
+    return conn
 
 
-def init_vertex():
-    """Initialise Vertex AI and return a text embedding model."""
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL_NAME)
-    return model
-
-
-def get_embedding(model: TextEmbeddingModel, text: str):
-    """Return a list[float] embedding for given text using text-embedding-004."""
-    # Newer API: just pass a list of strings
-    embeddings = model.get_embeddings([text])
-    return embeddings[0].values  # list of floats
+def get_embedding(model: TextEmbeddingModel, text: str) -> List[float]:
+    """Call Vertex embeddings API and return the first embedding vector."""
+    emb = model.get_embeddings([text])[0]
+    return emb.values  # list[float]
 
 
 def init_schema():
-    """Create documents table with a pgvector column if it doesn't exist."""
-    create_table_sql = f"""
-    CREATE TABLE IF NOT EXISTS documents (
-        id SERIAL PRIMARY KEY,
-        source_uri TEXT,
-        chunk_index INT,
-        content TEXT,
-        embedding vector({EMBEDDING_DIM})
-    );
-    """
-
+    """Create pgvector extension + documents table if not already present."""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(create_table_sql)
-            conn.commit()
+            # Enable pgvector
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            # 768 dims is correct for text-embedding-004
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    id SERIAL PRIMARY KEY,
+                    source_uri TEXT,
+                    chunk_index INT,
+                    content TEXT,
+                    embedding vector(768)
+                );
+                """
+            )
+        conn.commit()
     print("✅ Ensured documents table exists.")
 
 
 def insert_sample_row(model: TextEmbeddingModel):
-    text = (
-        "This is a sample document chunk for testing Vertex AI embeddings "
-        "with pgvector in Cloud SQL."
-    )
-    embedding = get_embedding(model, text)
-
-    # Convert embedding to pgvector string literal: '[0.1,0.2,...]'
-    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
-    insert_sql = """
-    INSERT INTO documents (source_uri, chunk_index, content, embedding)
-    VALUES (%s, %s, %s, %s::vector);
-    """
+    """Insert a single sample row with an embedding into documents."""
+    text = "This is a small sample document describing a retrieval-augmented generation demo."
+    emb = get_embedding(model, text)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                insert_sql,
-                ("sample", 0, text, embedding_str),
+                """
+                INSERT INTO documents (source_uri, chunk_index, content, embedding)
+                VALUES (%s, %s, %s, %s);
+                """,
+                (
+                    "sample://demo",
+                    0,
+                    text,
+                    emb,  # psycopg2 + pgvector understand list[float]
+                ),
             )
-            conn.commit()
+        conn.commit()
     print("✅ Inserted 1 sample row into documents table.")
+    print("🎉 Done. You now have one embedded row in Cloud SQL pgvector.")
 
 
 def main():
-    print("🔧 Initialising Vertex + Cloud SQL...")
     model = init_vertex()
     init_schema()
     insert_sample_row(model)
-    print("🎉 Done. You now have one embedded row in Cloud SQL pgvector.")
 
 
 if __name__ == "__main__":
