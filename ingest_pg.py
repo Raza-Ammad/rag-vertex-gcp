@@ -3,9 +3,10 @@ from dotenv import load_dotenv
 
 import psycopg2
 import vertexai
-from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
+from vertexai.language_models import TextEmbeddingModel
 
-# Load environment variables from .env
+# Load environment variables from .env if present (local dev),
+# but in Cloud Shell we mostly use exported env vars.
 load_dotenv()
 
 PROJECT_ID = os.getenv("GCP_PROJECT", "starry-journal-480011-m8")
@@ -17,8 +18,9 @@ DB_NAME = os.getenv("DB_NAME", "ragdb")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# 768 dims for text embedding model
+# text-embedding-004 produces 768-dim embeddings
 EMBEDDING_DIM = 768
+EMBEDDING_MODEL_NAME = "text-embedding-004"
 
 
 def get_connection():
@@ -36,15 +38,14 @@ def get_connection():
 def init_vertex():
     """Initialise Vertex AI and return a text embedding model."""
     vertexai.init(project=PROJECT_ID, location=LOCATION)
-    # textembedding-gecko@001 -> 768-dim embeddings suitable for RAG
-    model = TextEmbeddingModel.from_pretrained("textembedding-gecko@001")
+    model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL_NAME)
     return model
 
 
 def get_embedding(model: TextEmbeddingModel, text: str):
-    """Return a list[float] embedding for given text."""
-    inp = TextEmbeddingInput(text=text, task_type="RETRIEVAL_DOCUMENT")
-    embeddings = model.get_embeddings([inp])
+    """Return a list[float] embedding for given text using text-embedding-004."""
+    # Newer API: just pass a list of strings
+    embeddings = model.get_embeddings([text])
     return embeddings[0].values  # list of floats
 
 
