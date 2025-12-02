@@ -1,126 +1,157 @@
 import os
-import psycopg2
+from pathlib import Path
 from typing import List
+
+import psycopg2
+from psycopg2.extensions import connection as PGConnection
 
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
 
-# ---------------------------------------------------------------------
-# Config from environment (works on both Mac + Cloud Shell)
-# ---------------------------------------------------------------------
-GCP_PROJECT = os.environ.get("GCP_PROJECT", "starry-journal-480011-m8")
-GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+# ===== Config =====
 
-DB_HOST = os.environ.get("DB_HOST", "35.184.43.16")
-DB_PORT = int(os.environ.get("DB_PORT", "5432"))
-DB_NAME = os.environ.get("DB_NAME", "ragdb")
-DB_USER = os.environ.get("DB_USER", "postgres")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+# GCP / Vertex
+PROJECT_ID = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-004")
 
-# Updated embedding model
-EMBEDDING_MODEL_NAME = "text-embedding-004"
+# DB (using public IP – same values you already use)
+DB_HOST = os.getenv("DB_HOST", "35.184.43.16")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "ragdb")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD")  # must be set in env
 
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def init_vertex() -> TextEmbeddingModel:
-    """Initialise Vertex AI and load the embedding model."""
-    vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
-    model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL_NAME)
-    return model
+# Local docs folder
+DOCS_DIR = os.getenv("DOCS_DIR", "docs")
 
 
-def get_connection():
-    """Plain psycopg2 connection to Cloud SQL via public IP."""
+# ===== Helpers =====
+
+def get_connection() -> PGConnection:
+    if not DB_PASSWORD:
+        raise RuntimeError("DB_PASSWORD env var is not set. Export it before running.")
     return psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASSWORD,
-        connect_timeout=10,
     )
 
 
-def to_pgvector_literal(vec: List[float]) -> str:
-    """
-    Convert a Python list of floats into a pgvector literal string: [1.0,2.0,...]
-    """
-    return "[" + ",".join(str(x) for x in vec) + "]"
+def init_vertex() -> TextEmbeddingModel:
+    if not PROJECT_ID:
+        raise RuntimeError("GCP_PROJECT / GOOGLE_CLOUD_PROJECT not set.")
+    print("🔧 Initialising Vertex + Cloud SQL...")
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL_NAME)
+    return model
 
 
-def get_embedding(model: TextEmbeddingModel, text: str) -> List[float]:
-    """Call Vertex AI embedding model and return a float vector."""
-    resp = model.get_embeddings([text])
-    # Vertex returns a list of one embedding for a single input
-    return resp[0].values
-
-
-# ---------------------------------------------------------------------
-# DB schema + sample row
-# ---------------------------------------------------------------------
-def init_schema():
-    """Ensure the pgvector extension + documents table exist."""
-    print("✅ Ensuring documents table exists...")
+def ensure_schema() -> None:
     with get_connection() as conn:
         with conn.cursor() as cur:
-            # Enable pgvector
+            # pgvector extension + documents table
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-
-            # text-embedding-004 returns 768-dim vectors
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
                     id SERIAL PRIMARY KEY,
-                    source_uri TEXT,
-                    chunk_index INT,
-                    content TEXT,
-                    embedding vector(768)
+                    source_uri TEXT NOT NULL,
+                    chunk_index INT NOT NULL,
+                    content TEXT NOT NULL,
+                    embedding VECTOR(768)
                 );
                 """
             )
         conn.commit()
+    print("✅ Ensured documents table exists.")
 
 
-def insert_sample_row(embed_model: TextEmbeddingModel):
-    """Insert a single sample row so we can test RAG."""
-    sample_text = (
-        "This is a small sample document explaining what a RAG system does. "
-        "It stores text chunks with vector embeddings in pgvector and uses "
-        "Vertex Gemini to answer questions based on those chunks."
-    )
+def chunk_text(text: str, max_chars: int = 800, overlap: int = 200) -> List[str]:
+    """
+    Simple character-based chunker with overlap.
+    Good enough for a first demo.
+    """
+    text = text.replace("\r\n", "\n")
+    chunks: List[str] = []
 
-    embedding = get_embedding(embed_model, sample_text)
-    pgvec = to_pgvector_literal(embedding)
+    start = 0
+    length = len(text)
+
+    while start < length:
+        end = min(start + max_chars, length)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end - overlap  # move back a bit for overlap
+        if start < 0:
+            start = 0
+        if start >= length:
+            break
+
+    return chunks
+
+
+def get_embedding(model: TextEmbeddingModel, text: str) -> list:
+    resp = model.get_embeddings([text])
+    return resp[0].values
+
+
+def ingest_docs(model: TextEmbeddingModel) -> None:
+    docs_path = Path(DOCS_DIR)
+    if not docs_path.exists():
+        print(f"⚠️  Docs directory '{DOCS_DIR}' does not exist. Create it and add .txt files.")
+        return
+
+    all_txt_files = list(docs_path.rglob("*.txt"))
+    if not all_txt_files:
+        print(f"⚠️  No .txt files found under '{DOCS_DIR}'. Add some and re-run.")
+        return
+
+    print(f"📂 Found {len(all_txt_files)} .txt files under '{DOCS_DIR}'.")
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO documents (source_uri, chunk_index, content, embedding)
-                VALUES (%s, %s, %s, %s::vector);
-                """,
-                ("sample_doc.txt", 0, sample_text, pgvec),
-            )
+            for file_path in all_txt_files:
+                rel_path = str(file_path.relative_to(docs_path))
+                print(f"📄 Ingesting {rel_path} ...")
+
+                text = file_path.read_text(encoding="utf-8", errors="ignore")
+                chunks = chunk_text(text)
+
+                print(f"   → {len(chunks)} chunks")
+
+                # Clear existing rows for this file (so re-ingest doesn't duplicate)
+                cur.execute(
+                    "DELETE FROM documents WHERE source_uri = %s;",
+                    (rel_path,),
+                )
+
+                for idx, chunk in enumerate(chunks):
+                    emb = get_embedding(model, chunk)
+                    cur.execute(
+                        """
+                        INSERT INTO documents (source_uri, chunk_index, content, embedding)
+                        VALUES (%s, %s, %s, %s);
+                        """,
+                        (rel_path, idx, chunk, emb),
+                    )
+
         conn.commit()
 
-    print("✅ Inserted 1 sample row into documents table.")
-    print("🎉 Done. You now have one embedded row in Cloud SQL pgvector.")
+    print("✅ Finished ingesting all documents into pgvector.")
 
 
-# ---------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------
-def main():
-    print("🔧 Initialising Vertex + Cloud SQL...")
-
-    # Init embedding model
-    embed_model = init_vertex()
-
-    # Ensure DB schema + sample data
-    init_schema()
-    insert_sample_row(embed_model)
+def main() -> None:
+    try:
+        model = init_vertex()
+        ensure_schema()
+        ingest_docs(model)
+        print("🎉 Done. Your real documents are now in Cloud SQL pgvector.")
+    except Exception as e:
+        print(f"❌ Error during ingestion: {e}")
 
 
 if __name__ == "__main__":
