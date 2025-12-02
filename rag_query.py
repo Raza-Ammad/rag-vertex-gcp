@@ -20,7 +20,7 @@ DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 
 # Models
 EMBEDDING_MODEL_NAME = "text-embedding-004"
-QA_MODEL_NAME = "gemini-1.5-flash"  # this was working in your earlier tests
+QA_MODEL_NAME = "gemini-2.0-flash"  # this was working in your earlier tests
 
 
 # ---------------------------------------------------------------------
