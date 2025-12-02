@@ -1,0 +1,3 @@
+google-cloud-aiplatform
+python-dotenv
+psycopg2-binary
