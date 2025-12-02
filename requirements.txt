@@ -3,3 +3,6 @@ google-genai
 google-cloud-storage
 python-dotenv
 psycopg2-binary
+fastapi
+uvicorn[standard]
+python-multipart
